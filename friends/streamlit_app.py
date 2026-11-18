@@ -172,7 +172,7 @@ st.markdown(f"""
 @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Space+Grotesk:wght@500;700&display=swap');
 .stApp {{ background: {BG}; }}
 html, body, [class*="css"], .stMarkdown {{ font-family: 'JetBrains Mono', monospace; }}
-.block-container {{ padding-top: 1.1rem; }}
+.block-container {{ padding-top: 4.4rem; }}
 .ts-header {{ display:flex; flex-wrap:wrap; justify-content:space-between; align-items:center; gap:10px;
   border:1px solid {BORDER}; border-radius:12px; padding:12px 16px; background:{PANEL}; margin-bottom:10px; }}
 .ts-title {{ font-family:'Space Grotesk',sans-serif; font-weight:700; font-size:21px; color:{TEXT}; }}
@@ -189,7 +189,7 @@ header[data-testid="stHeader"] {{ background: {BG}; }}
 .st-key-nav > div > [role="tablist"] {{ position: sticky; top: 3.75rem; z-index: 50; background: {BG};
   padding-top: 4px; }}
 @media (max-width: 700px) {{
-  .block-container {{ padding: 0.6rem 0.65rem 3rem 0.65rem !important; }}
+  .block-container {{ padding: 4.2rem 0.65rem 3rem 0.65rem !important; }}
   .ts-header {{ padding: 10px 12px; gap: 6px; }}
   .ts-title {{ font-size: 18px; }}
   .ts-chip {{ font-size: 11px; padding: 2px 8px; margin: 2px 4px 0 0; display: inline-block; }}
