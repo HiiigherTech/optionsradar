@@ -1,7 +1,8 @@
 """
 Trendslinger Options Radar - FRIENDS EDITION (hosted on Streamlit Community Cloud)
-Everyone's watchlist, journal, notes and events live in their own browser session (Save/Load backup),
-no Webull connection, and each person uses their own Claude key and (optional) Tradier token.
+Members-only: each person signs in (team code + their own PIN). Their watchlist, journal, notes and events
+save to the team database (Supabase) and to their device. Team tab for shared ideas. No Webull connection;
+each person uses their own Claude key and (optional) Tradier token.
 
 Trendslinger Options Radar  (no signals - it does the checklist legwork, you make the call)
 
@@ -57,6 +58,7 @@ UP, DOWN, WARN = "#2EE6A0", "#FF5C7A", "#F5C04A"
 
 HERE = Path(__file__).parent
 JOURNAL_FILE = HERE / "options_radar_journal.json"
+SETTINGS_FILE = HERE / "options_radar_settings.json"
 EVENTS_FILE = HERE / "options_radar_events.json"
 WATCHLIST_FILE = HERE / "options_radar_watchlist.json"
 NOTES_FILE = HERE / "options_radar_event_notes.json"
@@ -1614,6 +1616,158 @@ def ask_radar(question, context, history, api_key, model):
     return "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
 
 
+# ----------------------------------------------------------------- TEAM PLATFORM (members-only, hosted)
+# Settings come from Streamlit "Secrets" (never from the code), e.g.
+#   [team]                      [supabase]
+#   code = "pick-a-team-code"   url = "https://xxxx.supabase.co"
+#   members = ["Louis", "A", "B"]   key = "sb_secret_..."
+#   admin = "Louis"
+def secret(section, key, default=None):
+    try:
+        return st.secrets[section][key]
+    except Exception:
+        return default
+
+
+TEAM_CODE = str(secret("team", "code", "") or "")
+TEAM_MEMBERS = [str(m) for m in (secret("team", "members", []) or [])]
+TEAM_ADMIN = str(secret("team", "admin", "") or "")
+TEAM_ON = bool(TEAM_CODE and TEAM_MEMBERS)
+SB_URL = str(secret("supabase", "url", "") or "").rstrip("/")
+SB_KEY = str(secret("supabase", "key", "") or "")
+DB_ON = bool(SB_URL and SB_KEY)
+
+
+def me():
+    return st.session_state.get("member", "")
+
+
+def _sb_headers(extra=None):
+    h = {"apikey": SB_KEY, "Content-Type": "application/json"}
+    if SB_KEY.startswith("eyJ"):                     # older "service_role" style key
+        h["Authorization"] = "Bearer " + SB_KEY
+    h.update(extra or {})
+    return h
+
+
+def sb(method, table, params=None, body=None, prefer=None):
+    """Talk to the team database (Supabase). Raises on any problem."""
+    if not DB_ON:
+        raise RuntimeError("team database not set up")
+    r = requests.request(method, f"{SB_URL}/rest/v1/{table}", params=params, timeout=8,
+                         data=None if body is None else json.dumps(body, default=str),
+                         headers=_sb_headers({"Prefer": prefer} if prefer else None))
+    if r.status_code >= 300:
+        raise RuntimeError(f"database said {r.status_code}: {r.text[:160]}")
+    try:
+        return r.json()
+    except Exception:
+        return None
+
+
+def hash_pin(pin, salt=None):
+    import hashlib
+    salt = salt or os.urandom(8).hex()
+    return salt + "$" + hashlib.pbkdf2_hmac("sha256", str(pin).encode(), salt.encode(), 120_000).hex()
+
+
+def pin_ok(pin, stored):
+    import hmac
+    try:
+        salt, _ = stored.split("$", 1)
+    except Exception:
+        return False
+    return hmac.compare_digest(hash_pin(pin, salt), stored)
+
+
+def session_token(member, pin_hash):
+    import hashlib
+    import hmac
+    return hmac.new(TEAM_CODE.encode(), f"{member}|{pin_hash or ''}".encode(), hashlib.sha256).hexdigest()
+
+
+def member_pin_hash(member):
+    rows = sb("GET", "radar_members", {"select": "pin_hash", "name": f"eq.{member}"})
+    return (rows[0].get("pin_hash") or "") if rows else ""
+
+
+def set_member_pin(member, pin_hash):
+    sb("POST", "radar_members", {"on_conflict": "name"}, [{"name": member, "pin_hash": pin_hash}],
+       "resolution=merge-duplicates,return=minimal")
+
+
+def cloud_load(member):
+    rows = sb("GET", "radar_user_data", {"select": "data", "member": f"eq.{member}"})
+    return rows[0].get("data") if rows else None
+
+
+def cloud_save(member, data):
+    sb("POST", "radar_user_data", {"on_conflict": "member"},
+       [{"member": member, "data": data, "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()}],
+       "resolution=merge-duplicates,return=minimal")
+
+
+@soft_cache(ttl=20, neg_ttl=10, default=[])
+def team_ideas(_bust=0):
+    return sb("GET", "radar_ideas", {"select": "*", "order": "created_at.desc", "limit": "60"}) or []
+
+
+@soft_cache(ttl=20, neg_ttl=10, default=[])
+def team_replies(_bust=0):
+    return sb("GET", "radar_replies", {"select": "*", "order": "created_at.asc", "limit": "500"}) or []
+
+
+@soft_cache(ttl=30, neg_ttl=10, default=[])
+def team_people(_bust=0):
+    return sb("GET", "radar_user_data", {"select": "member,updated_at,data"}) or []
+
+
+def team_bust():
+    st.session_state["team_bust"] = st.session_state.get("team_bust", 0) + 1
+
+
+def share_idea(ticker, side, note, strike=None, expiry=None, limit_price=None, delta=None, stock_price=None):
+    sb("POST", "radar_ideas", body=[{
+        "member": me(), "ticker": ticker, "side": side, "note": note or "",
+        "strike": None if strike is None else float(strike), "expiry": expiry or None,
+        "limit_price": None if limit_price is None else round(float(limit_price), 2),
+        "delta": None if delta is None else round(float(delta), 3),
+        "stock_price": None if stock_price is None else round(float(stock_price), 2)}],
+       prefer="return=minimal")
+    team_bust()
+
+
+def can_share():
+    return FRIENDS_EDITION and DB_ON and bool(me())
+
+
+def share_button(label_key, **idea):
+    """A small 'Share with team' button used on contract cards."""
+    if not can_share():
+        return
+    if st.button("Share with team", key="share_" + label_key):
+        try:
+            share_idea(**idea)
+            st.toast(f"Shared {idea.get('ticker')} with the team")
+        except Exception as e:
+            st.error(f"Couldn't share: {e}")
+
+
+def ago(ts):
+    try:
+        t = pd.to_datetime(ts, utc=True)
+        secs = (pd.Timestamp.now(tz="UTC") - t).total_seconds()
+    except Exception:
+        return ""
+    if secs < 90:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)} min ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)} hr ago"
+    return f"{int(secs // 86400)} days ago"
+
+
 # ----------------------------------------------------------------- Contract Search engine
 MONEYNESS = {   # choice -> (contract types allowed, starting delta range)
     "Any": (None, (0.55, 0.90)),
@@ -1695,14 +1849,26 @@ def looks_like_phone():
 
 _layout = st.session_state.get("layout_mode", "Auto")
 PHONE = (_layout == "Phone") or (_layout == "Auto" and looks_like_phone())
-# ----------------------------------------------------------------- this device: auto-save + home-screen icon
-LS_DATA, LS_KEYS = "ts_options_radar_data_v1", "ts_options_radar_keys_v1"
+# ----------------------------------------------------------------- this device + member sign-in
+LS_LEGACY_DATA, LS_LEGACY_KEYS, LS_SESSION = "ts_options_radar_data_v1", "ts_options_radar_keys_v1", "ts_radar_session"
+
+
+def data_key(m):
+    return ("ts_radar_data_" + m) if m else LS_LEGACY_DATA
+
+
+def keys_key(m):
+    return ("ts_radar_keys_" + m) if m else LS_LEGACY_KEYS
+
+
 try:
     from streamlit_js_eval import streamlit_js_eval as _js
 except Exception:
     _js = None
-if _js is None or os.environ.get("RADAR_NO_LOCALSTORE"):
+NO_DEVICE = _js is None or bool(os.environ.get("RADAR_NO_LOCALSTORE"))
+if NO_DEVICE:
     st.session_state.setdefault("ls_ready", True)
+    st.session_state.setdefault("device", {})
 
 HOME_SCREEN_JS = r"""
 setFrameHeight(0);
@@ -1719,7 +1885,7 @@ setFrameHeight(0);
       add('meta', {name: 'application-name', content: 'Options Radar'});
       add('meta', {name: 'theme-color', content: '#0E161A'});
       var m = {name: 'Trendslinger Options Radar', short_name: 'Options Radar', display: 'browser',
-               background_color: '#0E161A', theme_color: '#0E161A', start_url: w.location.origin + '/',
+               background_color: '#0E161A', theme_color: '#0E161A', start_url: w.location.href,
                icons: [{src: base + 'icon-192.png', sizes: '192x192', type: 'image/png'},
                        {src: base + 'icon-512.png', sizes: '512x512', type: 'image/png'},
                        {src: base + 'icon-maskable-512.png', sizes: '512x512', type: 'image/png', purpose: 'maskable'}]};
@@ -1729,53 +1895,212 @@ setFrameHeight(0);
   });
 })();
 """
+READ_DEVICE_JS = ("JSON.stringify(Object.fromEntries(Object.keys(localStorage).filter(function (k) "
+                  "{ return k.indexOf('ts_') === 0; }).map(function (k) { return [k, localStorage.getItem(k)]; })))")
+
+
+def brand_header():
+    st.markdown('<div class="ts-header"><div class="ts-title">Trendslinger <b>Options Radar</b></div></div>',
+                unsafe_allow_html=True)
+
+
+def queue_device(js):
+    st.session_state.setdefault("device_ops", []).append(js)
+
+
+def flush_device_ops():
+    ops = st.session_state.pop("device_ops", [])
+    if ops and not NO_DEVICE:
+        code = ";".join(ops)
+        _js(js_expressions="setFrameHeight(0);" + code + ";1", want_output=False,
+            key="ls_ops_" + str(abs(hash(code))))
+
 
 if not st.session_state.get("ls_ready"):
-    _raw = _js(js_expressions=HOME_SCREEN_JS + "JSON.stringify({d: localStorage.getItem('" + LS_DATA + "'), "
-               "k: localStorage.getItem('" + LS_KEYS + "')})", key="ls_load")
+    _raw = _js(js_expressions=HOME_SCREEN_JS + READ_DEVICE_JS, key="ls_load")
     if _raw is None:
-        st.markdown('<div class="ts-header"><div class="ts-title">Trendslinger <b>Options Radar</b></div></div>',
-                    unsafe_allow_html=True)
-        st.info("Loading your saved watchlist and journal...")
-        if st.button("Continue without my saved data", key="ls_skip"):
+        brand_header()
+        st.info("Loading...")
+        if st.button("Continue", key="ls_skip"):
             st.session_state["ls_ready"] = True
+            st.session_state["device"] = {}
             st.rerun()
         st.stop()
     try:
-        _got = json.loads(_raw) or {}
-        if _got.get("d"):
-            st.session_state["my_data"] = json.loads(_got["d"])
-        if _got.get("k"):
-            _k = json.loads(_got["k"])
-            st.session_state["tradier_token"] = _k.get("tradier", "")
-            st.session_state["claude_key"] = _k.get("claude", "")
-            st.session_state["remember_keys"] = True
+        st.session_state["device"] = json.loads(_raw) or {}
     except Exception:
-        pass
+        st.session_state["device"] = {}
     st.session_state["ls_ready"] = True
 
 
+def _device_json(key):
+    try:
+        v = st.session_state.get("device", {}).get(key)
+        return json.loads(v) if v else None
+    except Exception:
+        return None
+
+
+def load_my_stuff(m):
+    # Data: team database first, then this device, then the old (pre sign-in) copy on this device.
+    data, from_cloud = None, False
+    if m and DB_ON:
+        try:
+            data = cloud_load(m)
+            from_cloud = data is not None
+        except Exception as e:
+            st.session_state["cloud_err"] = str(e)[:160]
+    if data is None:
+        data = _device_json(data_key(m))
+    if data is None and m:
+        data = _device_json(LS_LEGACY_DATA)
+    st.session_state["my_data"] = data or {}
+    st.session_state["cloud_sig"] = "loaded" if from_cloud else None
+    keys = _device_json(keys_key(m)) or (_device_json(LS_LEGACY_KEYS) if m else None)
+    if keys:
+        st.session_state["tradier_token"] = keys.get("tradier", "")
+        st.session_state["claude_key"] = keys.get("claude", "")
+        st.session_state["remember_keys"] = True
+    st.session_state["loaded_for"] = m
+
+
+def finish_sign_in(m, remember, pin_hash):
+    st.session_state["member"] = m
+    if remember:
+        queue_device("localStorage.setItem(" + json.dumps(LS_SESSION) + ","
+                     + json.dumps(json.dumps({"m": m, "t": session_token(m, pin_hash)})) + ")")
+    else:
+        queue_device("localStorage.removeItem(" + json.dumps(LS_SESSION) + ")")
+    load_my_stuff(m)
+    st.rerun()
+
+
+def sign_in_screen():
+    import hmac
+    brand_header()
+    if not st.session_state.get("tried_auto"):
+        st.session_state["tried_auto"] = True
+        saved = _device_json(LS_SESSION)
+        if saved and saved.get("m") in TEAM_MEMBERS:
+            try:
+                ph = member_pin_hash(saved["m"]) if DB_ON else ""
+                if (ph or not DB_ON) and hmac.compare_digest(session_token(saved["m"], ph), str(saved.get("t"))):
+                    finish_sign_in(saved["m"], True, ph)
+            except Exception:
+                pass
+    st.markdown("### Sign in")
+    st.caption("Members only. Pick your name to get in.")
+    who = st.selectbox("Who are you?", ["Pick your name"] + TEAM_MEMBERS, key="si_who")
+    if who not in TEAM_MEMBERS:
+        flush_device_ops()
+        st.stop()
+    db_ok, ph = DB_ON, ""
+    if DB_ON:
+        try:
+            ph = member_pin_hash(who)
+        except Exception:
+            db_ok = False
+            st.warning("Can't reach the team database right now. Sign in with the team code; "
+                       "your data will save on this device until it's back.")
+    first_time = not (db_ok and ph)
+    with st.form("sign_in"):
+        if first_time:
+            st.markdown("**First time on this account.**" if db_ok else "**Enter the team code.**")
+            code = st.text_input("Team code (Louis gives you this)", type="password")
+            if db_ok:
+                new_pin = st.text_input("Make your own PIN: 4 to 8 numbers", type="password", max_chars=8)
+                new_pin2 = st.text_input("Type the same PIN again", type="password", max_chars=8)
+        else:
+            pin = st.text_input("Your PIN", type="password", max_chars=8)
+        remember = st.checkbox("Keep me signed in on this device", value=True)
+        go = st.form_submit_button("Sign in", type="primary")
+    if go:
+        fails = st.session_state.get("si_fails", 0)
+        if fails >= 5 and time.time() < st.session_state.get("si_lock", 0):
+            st.error("Too many tries. Wait a minute, then try again.")
+        elif first_time:
+            if not hmac.compare_digest(code.strip(), TEAM_CODE):
+                st.session_state["si_fails"] = fails + 1
+                st.session_state["si_lock"] = time.time() + 60
+                st.error("That team code isn't right. Check it with Louis.")
+            elif db_ok and (not new_pin.isdigit() or not 4 <= len(new_pin) <= 8):
+                st.error("Your PIN has to be 4 to 8 numbers.")
+            elif db_ok and new_pin != new_pin2:
+                st.error("The two PINs don't match. Type them again.")
+            else:
+                new_hash = ""
+                if db_ok:
+                    new_hash = hash_pin(new_pin)
+                    try:
+                        set_member_pin(who, new_hash)
+                    except Exception as e:
+                        st.error(f"Couldn't save your PIN: {e}")
+                        st.stop()
+                st.session_state["si_fails"] = 0
+                finish_sign_in(who, remember, new_hash)
+        else:
+            if pin_ok(pin, ph):
+                st.session_state["si_fails"] = 0
+                finish_sign_in(who, remember, ph)
+            else:
+                st.session_state["si_fails"] = fails + 1
+                st.session_state["si_lock"] = time.time() + 60
+                st.error("Wrong PIN. Forgot it? Ask Louis to reset it.")
+    flush_device_ops()
+    st.stop()
+
+
+if TEAM_ON and not me():
+    sign_in_screen()
+if st.session_state.get("loaded_for") != me():
+    load_my_stuff(me())
+
+
 def device_save():
-    """Write this visitor's data (and keys, if they asked) to their own browser. Runs at the end of each page."""
-    if _js is None or os.environ.get("RADAR_NO_LOCALSTORE") or not st.session_state.get("ls_ready"):
-        return
+    # Save this person's data to the team database (if set up) and to this device.
+    m = me()
     data = json.dumps(_store(), default=str, sort_keys=True)
+    if DB_ON and m:
+        sig = str(hash(data))
+        if sig != st.session_state.get("cloud_sig"):
+            try:
+                cloud_save(m, _store())
+                st.session_state["cloud_sig"] = sig
+                st.session_state.pop("cloud_err", None)
+            except Exception as e:
+                st.session_state["cloud_err"] = str(e)[:160]
+    if NO_DEVICE:
+        st.session_state.pop("device_ops", None)
+        return
     keys = (json.dumps({"tradier": st.session_state.get("tradier_token", ""),
                         "claude": st.session_state.get("claude_key", "")})
             if st.session_state.get("remember_keys") else "")
-    sig = str(hash((data, keys)))
-    if sig == st.session_state.get("ls_saved"):
-        return
-    st.session_state["ls_saved"] = sig
-    js = ("setFrameHeight(0);localStorage.setItem(" + json.dumps(LS_DATA) + "," + json.dumps(data) + ");"
-          + ("localStorage.setItem(" + json.dumps(LS_KEYS) + "," + json.dumps(keys) + ");" if keys
-             else "localStorage.removeItem(" + json.dumps(LS_KEYS) + ");") + "1")
-    _js(js_expressions=js, want_output=False, key="ls_save_" + sig.replace("-", "m"))
+    sig = str(hash((m, data, keys)))
+    if sig != st.session_state.get("ls_saved"):
+        st.session_state["ls_saved"] = sig
+        queue_device("localStorage.setItem(" + json.dumps(data_key(m)) + "," + json.dumps(data) + ")")
+        queue_device(("localStorage.setItem(" + json.dumps(keys_key(m)) + "," + json.dumps(keys) + ")") if keys
+                     else ("localStorage.removeItem(" + json.dumps(keys_key(m)) + ")"))
+    flush_device_ops()
 
 
 hdr_slot = st.container()
 focus_slot = st.container()
 with st.sidebar:
+    if me():
+        st.markdown(f"Signed in as **{me()}**")
+        if st.button("Sign out", key="sign_out"):
+            queue_device("localStorage.removeItem(" + json.dumps(LS_SESSION) + ")")
+            for _k in ("member", "my_data", "loaded_for", "cloud_sig", "tradier_token", "claude_key",
+                       "remember_keys", "tried_auto", "si_who"):
+                st.session_state.pop(_k, None)
+            st.session_state["tried_auto"] = True
+            st.rerun()
+        if st.session_state.get("cloud_err"):
+            st.warning("Couldn't save to the team database just now. Your changes are safe on this device "
+                       "and will sync when it's back.")
+    elif not TEAM_ON:
+        st.caption("Team sign-in isn't turned on yet.")
     _LEARNED_SECTORS.clear()
     _LEARNED_SECTORS.update(load_json(SECTORS_FILE, {}) or {})
     groups = load_watch_groups()
@@ -1827,8 +2152,8 @@ with st.sidebar:
     api_key = st.text_input("Your Claude API key", type="password", key="claude_key",
                             help="Get one at console.anthropic.com.")
     st.checkbox("Remember my keys on this device", key="remember_keys",
-                help="Saves your Claude key and Tradier token in this phone's or computer's browser only, "
-                     "never on the server. Leave it off on a shared device.")
+                help="Saves your Claude key and Tradier token on this phone or computer only, never on the server "
+                     "or in the team database. Leave it off on a shared device.")
     model = st.text_input("Model", "claude-sonnet-5-5")
     st.markdown("### Live data (optional)")
     saved_tok = tradier_token()
@@ -1849,8 +2174,8 @@ with st.sidebar:
     st.caption(get_webull()[1])
 
     st.markdown("### Backup")
-    st.caption("Your watchlist, journal and notes save on this device by themselves. Use these to move them "
-               "to another phone or computer. (Keys and tokens are never included.)")
+    st.caption("Your watchlist, journal and notes save by themselves. This is an extra copy you can keep. "
+               "(Keys and tokens are never included.)")
     st.download_button("Download a backup", json.dumps(_store(), indent=2, default=str),
                        file_name="my_options_radar_data.json", mime="application/json")
     up = st.file_uploader("Load a backup", type=["json"], key="my_data_upload")
@@ -1931,6 +2256,8 @@ quad = next_quad_witching(now.date())
 dflags = discount_flags(hist, vix_on)
 
 TAB_NAMES = ["Watchlist", "Market", "Scanner", "Contracts", "Contract Search", "Gamma", "History", "Journal", "Ask"]
+if FRIENDS_EDITION:
+    TAB_NAMES.append("Team")
 LAZY = not os.environ.get("RADAR_EAGER")
 if LAZY:
     try:      # only the tab you're looking at does any work
@@ -2413,6 +2740,10 @@ def render_contracts():
                                  f'<div>Breakeven {r["breakeven"]:,.2f} ({r["to BE %"]:+.1f}%)</div>'
                                  f'<div class="ts-muted">Loss limit: 20% = ${cost * 0.8:,.0f}, '
                                  f'30% = ${cost * 0.7:,.0f}</div>')
+                            share_button(f"c_{focus}_{exp}_{r['strike']:g}_{side}", ticker=focus,
+                                         side="Call" if is_call else "Put", strike=r["strike"], expiry=exp,
+                                         limit_price=r["limit"], delta=r["delta"], stock_price=S,
+                                         note=f"From Contracts ({r['type']})")
                 show_cols = ["contractSymbol", "strike", "type", "bid", "ask", "lastPrice", "limit", "spread%",
                              "delta", "theta", "impliedVolatility", "volume", "openInterest", "breakeven", "to BE %"]
                 show_cols = [x for x in show_cols if x in tab.columns]
@@ -2595,6 +2926,10 @@ def render_search():
                          f'{r["Data"]}</div>'
                          + (f'<div style="color:{WARN}">Against the weekly trend. The course says don\'t fight '
                             f'the weekly.</div>' if r["Trend"] == "Against weekly trend" else ""))
+                    share_button(f"s_{r['Ticker']}_{r['Expiry']}_{r['Strike']:g}_{r['Side']}", ticker=r["Ticker"],
+                                 side=r["Side"], strike=r["Strike"], expiry=r["Expiry"], limit_price=r["Limit $"],
+                                 delta=r["Delta"], stock_price=r["Stock"],
+                                 note=f"Contract Search pick: rank {r['Rank']}, setup {r['Setup']}, {r['Trend'].lower()}")
                     if st.button("Open in Contracts", key=f"open_{r['Ticker']}_{r['Expiry']}"):
                         if r["Ticker"] not in watchlist:
                             groups.setdefault("Search finds", []).append(r["Ticker"])
@@ -2805,6 +3140,13 @@ def render_history():
 # ----------------------------------------------------------------- Journal
 def render_journal():
     trades = load_json(JOURNAL_FILE, [])
+    if can_share():
+        settings = load_json(SETTINGS_FILE, {}) or {}
+        shared = st.toggle("Share my journal with the team", value=bool(settings.get("share_journal")),
+                           help="Your teammates see your trades (read-only) in the Team tab. Turn off any time.")
+        if shared != bool(settings.get("share_journal")):
+            settings["share_journal"] = shared
+            save_json(SETTINGS_FILE, settings)
     max_trades = st.number_input("Trades per year budget", 1, 50, key=keep("w_j_max", 12))
     this_year = [t for t in trades if str(t.get("entry_date", ""))[:4] == str(now.year)]
     col = DOWN if len(this_year) > max_trades else (WARN if len(this_year) >= max_trades - 1 else UP)
@@ -2933,7 +3275,8 @@ def render_ask():
                    f"Event breakdown:\n{st.session_state.get('breakdown', 'n/a')}\n"
                    f"Who is moving the index/sector:\n{st.session_state.get('movers', 'n/a')}\n"
                    f"Louis's event notes (his own read, not verified): {json.dumps(load_json(NOTES_FILE, {}))}\n"
-                   f"Open journal trades: {st.session_state.get('journal', '[]')}")
+                   f"Open journal trades: {st.session_state.get('journal', '[]')}\n"
+                   f"Team ideas (from teammates): {st.session_state.get('team_ctx', 'n/a')}")
             st.session_state["chat"].append({"role": "user", "content": q})
             with st.chat_message("user"):
                 st.markdown(q)
@@ -2948,8 +3291,161 @@ def render_ask():
 
 
 # ----------------------------------------------------------------- draw only the open tab
+def open_idea(i):
+    t = i.get("ticker")
+    if not t:
+        return
+    if t not in watchlist:
+        groups.setdefault("Team ideas", []).append(t)
+        save_json(WATCHLIST_FILE, groups)
+    st.session_state["focus_pending"] = t
+    pend = {"nav": "Contracts"} if LAZY else {}
+    if i.get("expiry"):
+        days = days_to(str(i["expiry"]))
+        pend.update({"w_c_exp": str(i["expiry"]), "w_c_side": "Puts" if i.get("side") == "Put" else "Calls",
+                     "w_c_money": "Any", "w_c_min_d": int(min(270, max(days, 0))), "w_c_max_d": int(max(550, days))})
+    st.session_state["apply_pending"] = pend
+    st.rerun()
+
+
+def render_team():
+    if not TEAM_ON:
+        st.info("The team sign-in isn't set up yet. Louis turns it on in the app's Secrets.")
+        return
+    if not DB_ON:
+        st.info("Signed in. Team sharing needs the team database, which Louis hasn't connected yet. "
+                "Everything else works, and your data saves on this device for now.")
+        return
+    bust = st.session_state.get("team_bust", 0)
+    people = {p["member"]: p for p in team_people(bust)}
+    cols = st.columns(max(len(TEAM_MEMBERS), 1))
+    for col, m in zip(cols, TEAM_MEMBERS):
+        p = people.get(m)
+        seen = ago(p["updated_at"]) if p else "not signed in yet"
+        you = " (you)" if m == me() else ""
+        with col:
+            card(f"{m}{you}", f'<div class="ts-muted">Last active {seen}</div>')
+
+    with st.expander("Post an idea", expanded=False):
+        with st.form("post_idea", clear_on_submit=True):
+            f1, f2 = st.columns(2)
+            t_pick = f1.selectbox("Stock", watchlist, format_func=lambda t: TICKER_LABELS.get(t, t))
+            side = f2.selectbox("Play", ["Call", "Put", "Stock", "Watching"])
+            f3, f4, f5 = st.columns(3)
+            strike = f3.number_input("Strike (optional)", 0.0, 100000.0, 0.0, 1.0)
+            exp_s = f4.text_input("Expiry (optional)", placeholder="2027-06-17")
+            lim = f5.number_input("Price (optional)", 0.0, 100000.0, 0.0, 0.05)
+            note = st.text_area("Why (trend, level, Fib, catalyst)", height=80)
+            if st.form_submit_button("Post to the team", type="primary"):
+                if not note.strip():
+                    st.error("Add a quick note so the others know why.")
+                else:
+                    try:
+                        df_t = hist.get(t_pick)
+                        px = live_price(t_pick, float(df_t["Close"].iloc[-1]) if df_t is not None else 0) or None
+                        share_idea(t_pick, side, note.strip(), strike or None, exp_s.strip() or None, lim or None,
+                                   None, px)
+                        st.toast("Posted")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Couldn't post: {e}")
+
+    ideas = team_ideas(bust)
+    replies = team_replies(bust)
+    top = st.columns([3, 1])
+    top[0].markdown("#### Team ideas")
+    if top[1].button("Refresh", key="team_refresh"):
+        team_bust()
+        st.rerun()
+    if not ideas:
+        st.caption("No ideas yet. Share one from Contract Search or Contracts, or post one above.")
+    now_q = live_quotes(tuple(sorted({i["ticker"] for i in ideas if i.get("ticker")})))
+    for i in ideas:
+        t = i.get("ticker", "")
+        lab = TICKER_LABELS.get(t, t)
+        contract = ""
+        if i.get("strike"):
+            contract = f" {float(i['strike']):g}"
+        if i.get("expiry"):
+            contract += f" exp {i['expiry']}"
+        price = f' at ${float(i["limit_price"]):.2f}' if i.get("limit_price") else ""
+        moved = ""
+        q = now_q.get(t)
+        if q and i.get("stock_price"):
+            ch = (q["Last"] / float(i["stock_price"]) - 1) * 100
+            moved = (f'<div>{lab} ${float(i["stock_price"]):,.2f} then, ${q["Last"]:,.2f} now '
+                     f'<span style="color:{UP if ch >= 0 else DOWN}">({ch:+.1f}%)</span></div>')
+        delta = f'<span class="ts-muted"> delta {float(i["delta"]):+.2f}</span>' if i.get("delta") is not None else ""
+        card(f'{i.get("member", "?")} &middot; {lab} {i.get("side", "")}{contract}{price}',
+             f'<div class="ts-muted">{ago(i.get("created_at"))}</div>{moved}'
+             f'<div style="white-space:pre-wrap">{(i.get("note") or "").replace("<", "&lt;")}</div>{delta}')
+        reps = [r for r in replies if r.get("idea_id") == i.get("id")]
+        b1, b2, b3 = st.columns([1, 1, 1])
+        if b1.button("Open in Contracts", key=f"ti_open_{i['id']}"):
+            open_idea(i)
+        with b2.popover(f"Replies ({len(reps)})"):
+            for r in reps:
+                st.markdown(f"**{r.get('member')}** · {ago(r.get('created_at'))}  \n{r.get('body', '')}")
+            with st.form(f"reply_{i['id']}", clear_on_submit=True):
+                body = st.text_input("Reply")
+                if st.form_submit_button("Send") and body.strip():
+                    try:
+                        sb("POST", "radar_replies", body=[{"idea_id": i["id"], "member": me(), "body": body.strip()}],
+                           prefer="return=minimal")
+                        team_bust()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Couldn't reply: {e}")
+        if i.get("member") == me() or me() == TEAM_ADMIN:
+            if b3.button("Delete", key=f"ti_del_{i['id']}"):
+                try:
+                    sb("DELETE", "radar_ideas", {"id": f"eq.{i['id']}"})
+                    team_bust()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Couldn't delete: {e}")
+
+    st.markdown("#### Teammates' journals")
+    shown = 0
+    for m, p in people.items():
+        if m == me():
+            continue
+        data = p.get("data") or {}
+        if not (data.get(SETTINGS_FILE.name) or {}).get("share_journal"):
+            continue
+        shown += 1
+        trades = data.get(JOURNAL_FILE.name) or []
+        opened = [t for t in trades if t.get("status") == "open"]
+        closed = [t for t in trades if t.get("status") == "closed" and t.get("exit") and t.get("entry")]
+        wins = sum(1 for t in closed if float(t["exit"]) > float(t["entry"]))
+        with st.expander(f"{m}: {len(opened)} open, {len(closed)} closed"
+                         + (f", {wins}/{len(closed)} winners" if closed else "")):
+            rows = [{"Ticker": t["ticker"], "Contract": f"{t['expiry']} {t['strike']:g} {t['right']}",
+                     "Entry $": t["entry"], "Now/Exit $": t.get("exit") if t["status"] == "closed" else t.get("current"),
+                     "Status": t["status"], "Why": t.get("why", "")} for t in trades]
+            if rows:
+                show_df(pd.DataFrame(rows), phone=["Ticker", "Contract", "Status"], hide_index=True)
+            else:
+                st.caption("No trades logged yet.")
+    if not shown:
+        st.caption("Nobody else is sharing their journal yet. Each person turns it on at the top of their Journal tab.")
+
+    if me() and me() == TEAM_ADMIN:
+        with st.expander("Admin: reset someone's PIN"):
+            who = st.selectbox("Member", [m for m in TEAM_MEMBERS if m != me()] or TEAM_MEMBERS, key="admin_who")
+            if st.button("Reset their PIN", key="admin_reset"):
+                try:
+                    set_member_pin(who, "")
+                    st.success(f"Done. {who} signs in with the team code and makes a new PIN.")
+                except Exception as e:
+                    st.error(f"Couldn't reset: {e}")
+    st.session_state["team_ctx"] = json.dumps([{k: i.get(k) for k in ("member", "ticker", "side", "strike", "expiry",
+                                                                       "limit_price", "note", "created_at")}
+                                               for i in ideas[:15]], default=str)
+
+
 RENDERERS = [render_watchlist, render_market, render_scanner, render_contracts, render_search,
-             render_gamma, render_history, render_journal, render_ask]
+             render_gamma, render_history, render_journal, render_ask, render_team][:len(TAB_NAMES)]
 for _i, _fn in enumerate(RENDERERS):
     if tab_open(_i):
         with tabs[_i]:
