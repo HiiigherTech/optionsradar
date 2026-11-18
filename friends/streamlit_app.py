@@ -185,6 +185,9 @@ html, body, [class*="css"], .stMarkdown {{ font-family: 'JetBrains Mono', monosp
 .ts-flag {{ border-left:3px solid {WARN}; padding:6px 10px; margin:4px 0; background:{BG}; border-radius:6px; font-size:13px; }}
 .ts-good {{ border-left-color:{UP}; }}
 .ts-bad {{ border-left-color:{DOWN}; }}
+header[data-testid="stHeader"] {{ background: {BG}; }}
+.st-key-nav > div > [role="tablist"] {{ position: sticky; top: 3.75rem; z-index: 50; background: {BG};
+  padding-top: 4px; }}
 @media (max-width: 700px) {{
   .block-container {{ padding: 0.6rem 0.65rem 3rem 0.65rem !important; }}
   .ts-header {{ padding: 10px 12px; gap: 6px; }}
@@ -196,8 +199,8 @@ html, body, [class*="css"], .stMarkdown {{ font-family: 'JetBrains Mono', monosp
   .ts-flag {{ font-size: 12.5px; }}
   [data-baseweb="tab-list"] {{ gap: 2px; overflow-x: auto; scrollbar-width: none; }}
   [data-baseweb="tab-list"]::-webkit-scrollbar {{ display: none; }}
-  button[data-baseweb="tab"] {{ padding: 6px 10px !important; white-space: nowrap; }}
-  button[data-baseweb="tab"] p {{ font-size: 14px !important; }}
+  button[data-baseweb="tab"], [role="tab"] {{ padding: 6px 10px !important; white-space: nowrap; }}
+  button[data-baseweb="tab"] p, [role="tab"] p {{ font-size: 14px !important; }}
   [data-testid="stHorizontalBlock"] {{ gap: 0.5rem; }}
   h4 {{ font-size: 1.05rem !important; }}
   h5 {{ font-size: 0.98rem !important; }}
@@ -339,6 +342,22 @@ def _mem():
     return {"soft": {}, "hist": {}, "miss": {}, "disk_loaded": set(), "analyze": {}, "lock": threading.RLock()}
 
 
+SOFT_MAX = 700          # most cached answers kept at once (option chains are the big ones)
+
+
+def _trim_soft(m, now_ts):
+    """Keep server memory flat over days of use: drop expired answers, then the oldest if still too many."""
+    soft = m["soft"]
+    if len(soft) <= SOFT_MAX:
+        return
+    with m["lock"]:
+        for k in [k for k, v in list(soft.items()) if v[0] < now_ts]:
+            soft.pop(k, None)
+        if len(soft) > SOFT_MAX:
+            for k, _ in sorted(list(soft.items()), key=lambda kv: kv[1][0])[: len(soft) - SOFT_MAX + 100]:
+                soft.pop(k, None)
+
+
 def soft_cache(ttl, neg_ttl=60, default=None, reraise=False, empty=lambda v: False):
     """TTL cache that never lets a failure get stuck.
     Good results are kept for `ttl` seconds. A failure or an empty result is only remembered for
@@ -359,9 +378,11 @@ def soft_cache(ttl, neg_ttl=60, default=None, reraise=False, empty=lambda v: Fal
                 val = fn(*args)
                 bad = empty(val)
                 m["soft"][key] = (now_ts + (neg_ttl if bad else ttl), val, None)
+                _trim_soft(m, now_ts)
                 return val
             except Exception as e:
                 m["soft"][key] = (now_ts + neg_ttl, default, e)
+                _trim_soft(m, now_ts)
                 if reraise:
                     raise
                 return default
@@ -1633,7 +1654,12 @@ TEAM_CODE = str(secret("team", "code", "") or "")
 TEAM_MEMBERS = [str(m) for m in (secret("team", "members", []) or [])]
 TEAM_ADMIN = str(secret("team", "admin", "") or "")
 TEAM_ON = bool(TEAM_CODE and TEAM_MEMBERS)
-SB_URL = str(secret("supabase", "url", "") or "").rstrip("/")
+SB_URL = str(secret("supabase", "url", "") or "").strip().rstrip("/")
+for _tail in ("/rest/v1", "/rest"):               # people often paste the "API URL" with /rest/v1 on the end
+    if SB_URL.endswith(_tail):
+        SB_URL = SB_URL[: -len(_tail)]
+if SB_URL and not SB_URL.startswith("http"):
+    SB_URL = "https://" + SB_URL
 SB_KEY = str(secret("supabase", "key", "") or "")
 DB_ON = bool(SB_URL and SB_KEY)
 
@@ -1872,6 +1898,21 @@ if NO_DEVICE:
 
 HOME_SCREEN_JS = r"""
 setFrameHeight(0);
+(function () {
+  // Always use the clean full-screen view: add ?embed=true on Streamlit's site (hides its top bar and
+  // Manage app button). Tried once per visit, so it can never loop.
+  try {
+    var t = window.top;
+    if (t.location.hostname.endsWith('.streamlit.app') && t.location.search.indexOf('embed=true') < 0
+        && !t.sessionStorage.getItem('ts_embed_tried')) {
+      t.sessionStorage.setItem('ts_embed_tried', '1');
+      // run inside the top page itself (this little frame isn't allowed to move the top page)
+      var sc = t.document.createElement('script');
+      sc.textContent = "(function(){var u=new URL(location.href);u.searchParams.set('embed','true');location.replace(u.toString());})();";
+      t.document.head.appendChild(sc);
+    }
+  } catch (e) {}
+})();
 (function () {
   var href = window.location.href, i = href.indexOf('/component/');
   var base = (i > 0 ? href.slice(0, i) : window.parent.location.origin) + '/app/static/';

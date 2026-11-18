@@ -1,4 +1,5 @@
-streamlit
+streamlit==1.67.0
+streamlit-js-eval==1.0.0
 yfinance
 plotly
 pandas
@@ -6,4 +7,3 @@ numpy
 requests
 anthropic
 tzdata
-streamlit-js-eval
