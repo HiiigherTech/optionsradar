@@ -1877,7 +1877,8 @@ def best_contract_for(t, S, cg, side_call, exps, budget, dlo, dhi, min_oi, max_s
     """Best contract for one stock across the given expirations, or (None, reason)."""
     allowed = MONEYNESS.get(moneyness, MONEYNESS["Any"])[0]
     label = "" if allowed is None else f"{moneyness} "
-    best, best_src, reason = None, None, f"no {label}contract fit the budget and rules"
+    best, best_src = None, None
+    cheapest_fit, saw_pricey, any_chain = None, False, False
     tgt_delta = (dlo + dhi) / 2
     width = max(dhi - dlo, 0.1)
     for e in exps:
@@ -1888,26 +1889,28 @@ def best_contract_for(t, S, cg, side_call, exps, budget, dlo, dhi, min_oi, max_s
         raw, src = enrich_chain_live(calls if side_call else puts, S, t, e)
         if raw is None or raw.empty:
             continue
+        any_chain = True
         tab = contract_table(raw, S, e, rate, side_call, hv)
         tab["cost"] = tab["limit"] * 100
-        ok = tab[(tab["limit"] > 0) & (tab["cost"] <= budget) &
-                 (tab["delta"].abs() >= dlo) & (tab["delta"].abs() <= dhi) &
-                 (tab["openInterest"] >= min_oi) &
-                 ((tab["spread%"] <= max_spread) | tab["spread%"].isna())].copy()
+        # everything that passes your rules, before looking at the budget
+        rules = tab[(tab["limit"] > 0) &
+                    (tab["delta"].abs() >= dlo) & (tab["delta"].abs() <= dhi) &
+                    (tab["openInterest"] >= min_oi) &
+                    ((tab["spread%"] <= max_spread) | tab["spread%"].isna())].copy()
         if allowed is not None:
-            ok = ok[ok["type"].isin(allowed)]
-        if skip_pricey and not ok.empty:
-            if (ok["Price"] == "Pricey").all():
-                reason = "every contract that fit was Pricey (IV well above how much the stock really moves)"
-            ok = ok[ok["Price"] != "Pricey"]
-        if side_call and cg is not None and not ok.empty:
+            rules = rules[rules["type"].isin(allowed)]
+        if side_call and cg is not None and not rules.empty:
             target = S * (1 + cg / 2) ** years_to(e)
-            ok = ok[ok["strike"] <= target * 1.02]
+            rules = rules[rules["strike"] <= target * 1.02]
+        if skip_pricey and not rules.empty:
+            saw_pricey = saw_pricey or (rules["Price"] == "Pricey").all()
+            rules = rules[rules["Price"] != "Pricey"]
+        if rules.empty:
+            continue
+        ok = rules[rules["cost"] <= budget].copy()
         if ok.empty:
-            pool_t = tab if allowed is None else tab[tab["type"].isin(allowed)]
-            if len(pool_t) and (pool_t["cost"] > budget).all():
-                reason = (f"cheapest {label}contract is over budget "
-                          f"(from ${pool_t['cost'][pool_t['cost'] > 0].min():,.0f})")
+            c_min = float(rules["cost"].min())
+            cheapest_fit = c_min if cheapest_fit is None else min(cheapest_fit, c_min)
             continue
         spread_pts = np.where(ok["spread%"].isna(), 0.25, (1 - ok["spread%"] / max_spread).clip(0, 1))
         price_pts = ((1.3 - ok["IV/HV"]) / 0.5).clip(0, 1).fillna(0.5)    # 0.8 or less = full, 1.3+ = none
@@ -1920,7 +1923,19 @@ def best_contract_for(t, S, cg, side_call, exps, budget, dlo, dhi, min_oi, max_s
         top["expiry"] = e
         if best is None or top["Fit"] > best["Fit"]:
             best, best_src = top, src
-    return (best, best_src) if best is not None else (None, reason)
+    if best is not None:
+        return best, best_src
+    if not any_chain:
+        return None, "couldn't load its option chain"
+    if cheapest_fit is not None:
+        return None, (f"over budget: the cheapest {label}contract that fits your rules is "
+                      f"${cheapest_fit:,.0f}")
+    if saw_pricey:
+        return None, "every contract that fit was Pricey (IV well above how much the stock really moves)"
+    rule_txt = f"delta {dlo:.2f}-{dhi:.2f}, open interest {min_oi:,}+, spread under {max_spread:g}%"
+    if side_call and cg is not None:
+        rule_txt += ", strike at or under the target"
+    return None, f"no {label}contract passes your rules ({rule_txt}), at any price"
 
 
 # ================================================================= UI
@@ -3051,7 +3066,12 @@ def render_search():
             if not res.empty:
                 res = res.sort_values("Rank", ascending=False).reset_index(drop=True)
             st.session_state["search_results"] = res
-            st.session_state["search_misses"] = pd.DataFrame(misses)
+            mdf = pd.DataFrame(misses)
+            if not mdf.empty:
+                need = mdf["Why"].str.extract(r"^over budget.*\$([\d,]+)$")[0].str.replace(",", "")
+                mdf["Needs $"] = pd.to_numeric(need, errors="coerce")
+                mdf = mdf.sort_values("Needs $", na_position="last").reset_index(drop=True)
+            st.session_state["search_misses"] = mdf
             st.session_state["search_skipped"] = (n_qual, skipped)
             st.session_state["search_meta"] = (f"${budget:,.0f} budget, {s_side.lower()}, "
                                                f"{s_money if s_money != 'Any' else 'ITM or OTM'}, "
@@ -3123,7 +3143,11 @@ def render_search():
         misses = st.session_state.get("search_misses")
         if misses is not None and not misses.empty:
             with st.expander(f"No match for {len(misses)} stocks (why)"):
-                show_df(misses, hide_index=True)
+                if "Needs $" in misses and misses["Needs $"].notna().any():
+                    st.caption("Needs $ = the cheapest contract that passes your rules. Closest to your budget "
+                               "are at the top. Raise the budget to at least that to see them.")
+                cols = [c for c in ("Ticker", "Needs $", "Why") if c in misses]
+                show_df(misses[cols].style.format({"Needs $": "${:,.0f}"}, na_rep="-"), hide_index=True)
 
 # ----------------------------------------------------------------- Gamma
 def render_gamma():
