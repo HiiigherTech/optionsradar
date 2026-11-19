@@ -1293,7 +1293,61 @@ def greeks(S, K, T, iv, r, call=True):
     return delta, gamma
 
 
-def contract_table(df, S, exp, r, call):
+def _ncdf_fast(x):
+    """Vectorized normal CDF (Abramowitz-Stegun, error < 2e-7). Fast enough to solve IV for whole chains."""
+    x = np.asarray(x, float)
+    z = np.abs(x) / math.sqrt(2)
+    t = 1 / (1 + 0.3275911 * z)
+    y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * np.exp(-z * z)
+    return 0.5 * (1 + np.sign(x) * y)
+
+
+def bs_price(S, K, T, iv, r, call):
+    K = np.asarray(K, float)
+    iv = np.clip(np.asarray(iv, float), 1e-4, 10.0)
+    T = max(T, 1 / 365)
+    sq = iv * np.sqrt(T)
+    d1 = (np.log(S / K) + (r + 0.5 * iv ** 2) * T) / sq
+    d2 = d1 - sq
+    if call:
+        return S * _ncdf_fast(d1) - K * np.exp(-r * T) * _ncdf_fast(d2)
+    return K * np.exp(-r * T) * _ncdf_fast(-d2) - S * _ncdf_fast(-d1)
+
+
+def implied_vol(price, S, K, T, r, call):
+    """IV backed out of the price you'd actually pay. NaN when the price has too little time value to tell."""
+    price = np.asarray(price, float)
+    K = np.asarray(K, float)
+    lo, hi = np.full(price.shape, 0.01), np.full(price.shape, 4.0)
+    for _ in range(40):
+        m = (lo + hi) / 2
+        rich = bs_price(S, K, T, m, r, call) > price
+        hi, lo = np.where(rich, m, hi), np.where(rich, lo, m)
+    floor = bs_price(S, K, T, 0.01, r, call)
+    ok = (price > 0) & (price - floor > np.maximum(0.05, 0.01 * price)) & (price < bs_price(S, K, T, 4.0, r, call))
+    return np.where(ok, (lo + hi) / 2, np.nan)
+
+
+def hist_vol(c, days=252):
+    """How much the stock actually moved: annualized volatility of daily returns."""
+    try:
+        lr = np.log(c.astype(float)).diff().dropna().iloc[-days:]
+        v = float(lr.std() * math.sqrt(252))
+        return v if 0.02 < v < 5 else None
+    except Exception:
+        return None
+
+
+PRICE_CHEAP, PRICE_PRICEY = 0.95, 1.25     # IV / actual-move ratio cutoffs
+
+
+def price_label(ratio):
+    if ratio is None or pd.isna(ratio):
+        return "-"
+    return "Cheap" if ratio <= PRICE_CHEAP else ("Pricey" if ratio >= PRICE_PRICEY else "Fair")
+
+
+def contract_table(df, S, exp, r, call, hv=None):
     df = df.copy()
     for col in ("bid", "ask", "lastPrice", "volume", "openInterest", "impliedVolatility"):
         if col not in df:
@@ -1318,6 +1372,12 @@ def contract_table(df, S, exp, r, call):
     # suggested limit: last trade if it sits inside the spread, otherwise the mid
     inside = both & (df["lastPrice"] >= df["bid"]) & (df["lastPrice"] <= df["ask"])
     df["limit"] = np.where(inside, df["lastPrice"], df["mid"]).round(2)
+    # price check: IV implied by what you'd pay vs how much the stock has really moved over the past year
+    yiv = df["impliedVolatility"].where((df["impliedVolatility"] > 0.03) & (df["impliedVolatility"] < 3))
+    df["IV"] = pd.Series(implied_vol(df["mid"].values, S, df["strike"].values, years_to(exp), r, call),
+                         index=df.index).fillna(yiv)
+    df["IV/HV"] = (df["IV"] / hv) if hv else np.nan
+    df["Price"] = df["IV/HV"].map(price_label)
     return df
 
 
@@ -1812,7 +1872,8 @@ MONEY_NOTES = {"Any": "ITM or OTM, whichever fits best.",
                       "higher risk of expiring worthless."}
 
 
-def best_contract_for(t, S, cg, side_call, exps, budget, dlo, dhi, min_oi, max_spread, rate, moneyness="Any"):
+def best_contract_for(t, S, cg, side_call, exps, budget, dlo, dhi, min_oi, max_spread, rate, moneyness="Any",
+                      hv=None, skip_pricey=False):
     """Best contract for one stock across the given expirations, or (None, reason)."""
     allowed = MONEYNESS.get(moneyness, MONEYNESS["Any"])[0]
     label = "" if allowed is None else f"{moneyness} "
@@ -1827,7 +1888,7 @@ def best_contract_for(t, S, cg, side_call, exps, budget, dlo, dhi, min_oi, max_s
         raw, src = enrich_chain_live(calls if side_call else puts, S, t, e)
         if raw is None or raw.empty:
             continue
-        tab = contract_table(raw, S, e, rate, side_call)
+        tab = contract_table(raw, S, e, rate, side_call, hv)
         tab["cost"] = tab["limit"] * 100
         ok = tab[(tab["limit"] > 0) & (tab["cost"] <= budget) &
                  (tab["delta"].abs() >= dlo) & (tab["delta"].abs() <= dhi) &
@@ -1835,6 +1896,10 @@ def best_contract_for(t, S, cg, side_call, exps, budget, dlo, dhi, min_oi, max_s
                  ((tab["spread%"] <= max_spread) | tab["spread%"].isna())].copy()
         if allowed is not None:
             ok = ok[ok["type"].isin(allowed)]
+        if skip_pricey and not ok.empty:
+            if (ok["Price"] == "Pricey").all():
+                reason = "every contract that fit was Pricey (IV well above how much the stock really moves)"
+            ok = ok[ok["Price"] != "Pricey"]
         if side_call and cg is not None and not ok.empty:
             target = S * (1 + cg / 2) ** years_to(e)
             ok = ok[ok["strike"] <= target * 1.02]
@@ -1845,10 +1910,12 @@ def best_contract_for(t, S, cg, side_call, exps, budget, dlo, dhi, min_oi, max_s
                           f"(from ${pool_t['cost'][pool_t['cost'] > 0].min():,.0f})")
             continue
         spread_pts = np.where(ok["spread%"].isna(), 0.25, (1 - ok["spread%"] / max_spread).clip(0, 1))
-        ok["Fit"] = (40 * (1 - (ok["delta"].abs() - tgt_delta).abs() / width).clip(0, 1)
+        price_pts = ((1.3 - ok["IV/HV"]) / 0.5).clip(0, 1).fillna(0.5)    # 0.8 or less = full, 1.3+ = none
+        ok["Fit"] = (35 * (1 - (ok["delta"].abs() - tgt_delta).abs() / width).clip(0, 1)
                      + 20 * spread_pts
-                     + 20 * (np.log10(ok["openInterest"].clip(lower=1)) / 4).clip(0, 1)
-                     + 20 * (1 - ok["to BE %"].abs() / 30).clip(0, 1)).round(0)
+                     + 15 * (np.log10(ok["openInterest"].clip(lower=1)) / 4).clip(0, 1)
+                     + 15 * (1 - ok["to BE %"].abs() / 30).clip(0, 1)
+                     + 15 * price_pts).round(0)
         top = ok.loc[ok["Fit"].idxmax()].copy()
         top["expiry"] = e
         if best is None or top["Fit"] > best["Fit"]:
@@ -2737,7 +2804,8 @@ def render_contracts():
                 calls, puts = option_chain(focus, exp)
                 is_call = side == "Calls"
                 raw, live_src = enrich_chain_live(calls if is_call else puts, S, focus, exp)
-                tab = contract_table(raw, S, exp, rate, is_call)
+                hv = hist_vol(c)
+                tab = contract_table(raw, S, exp, rate, is_call, hv)
                 if live_src:
                     st.caption(f"Live from {live_src}: bid/ask, last, volume, open interest, IV, delta, gamma and theta.")
                 else:
@@ -2779,25 +2847,32 @@ def render_contracts():
                                  f'<div>OI {int(r["openInterest"]):,}, vol {int(r["volume"]):,}, '
                                  f'spread {spr}</div>'
                                  f'<div>Breakeven {r["breakeven"]:,.2f} ({r["to BE %"]:+.1f}%)</div>'
+                                 + price_line(r["Price"], r["IV"], hv) +
                                  f'<div class="ts-muted">Loss limit: 20% = ${cost * 0.8:,.0f}, '
                                  f'30% = ${cost * 0.7:,.0f}</div>')
                             share_button(f"c_{focus}_{exp}_{r['strike']:g}_{side}", ticker=focus,
                                          side="Call" if is_call else "Put", strike=r["strike"], expiry=exp,
                                          limit_price=r["limit"], delta=r["delta"], stock_price=S,
                                          note=f"From Contracts ({r['type']})")
-                show_cols = ["contractSymbol", "strike", "type", "bid", "ask", "lastPrice", "limit", "spread%",
-                             "delta", "theta", "impliedVolatility", "volume", "openInterest", "breakeven", "to BE %"]
+                show_cols = ["contractSymbol", "strike", "type", "bid", "ask", "lastPrice", "limit", "Price", "spread%",
+                             "delta", "theta", "IV", "IV/HV", "volume", "openInterest", "breakeven", "to BE %"]
                 show_cols = [x for x in show_cols if x in tab.columns]
                 st.markdown("##### Full chain")
                 only_pass = st.checkbox("Show only contracts that pass the filters", key=keep("w_c_pass", True))
                 base = picks if only_pass else tab.sort_values("strike")
                 sty = base[show_cols].style.format({
                     "strike": "{:g}", "bid": "{:.2f}", "ask": "{:.2f}", "lastPrice": "{:.2f}", "limit": "{:.2f}",
-                    "spread%": "{:.1f}", "delta": "{:+.2f}", "theta": "{:+.3f}", "impliedVolatility": "{:.0%}",
+                    "spread%": "{:.1f}", "delta": "{:+.2f}", "theta": "{:+.3f}", "IV": "{:.0%}", "IV/HV": "{:.2f}",
                     "volume": "{:,.0f}", "openInterest": "{:,.0f}", "breakeven": "{:,.2f}", "to BE %": "{:+.1f}"},
                     na_rep="-")
-                show_df(sty, phone=["strike", "type", "limit", "delta", "openInterest", "spread%", "to BE %"],
+                show_df(style_map(sty, price_color, ["Price"]),
+                        phone=["strike", "type", "limit", "Price", "delta", "openInterest", "to BE %"],
                         hide_index=True)
+                if hv:
+                    st.caption(f"Price: the IV you'd pay vs how much {focus} really moved over the past year "
+                               f"({hv:.0%}). Cheap = IV at or under {PRICE_CHEAP:.2f}x that, Pricey = "
+                               f"{PRICE_PRICEY:.2f}x or more. Deep ITM contracts often show '-' because they're "
+                               "almost all stock value, with too little time value to read.")
                 st.session_state["picks"] = picks.head(5)[show_cols].to_csv(index=False)
             except Exception as e:
                 st.error(f"Couldn't load the {exp} chain: {e}")
@@ -2811,9 +2886,30 @@ def render_contracts():
                         unsafe_allow_html=True)
 
 # ----------------------------------------------------------------- Contract Search
+def price_line(label, iv, hv):
+    if label == "-" or not hv or pd.isna(iv):
+        return ""
+    col = {"Cheap": UP, "Pricey": DOWN}.get(label, WARN)
+    return (f'<div>Price: <b style="color:{col}">{label}</b> '
+            f'<span class="ts-muted">(IV {iv:.0%} vs real moves {hv:.0%})</span></div>')
+
+
+def price_color(v):
+    return {"Cheap": f"color: {UP}", "Pricey": f"color: {DOWN}", "Fair": f"color: {WARN}"}.get(v, "")
+
+
 def render_search():
     st.caption("Give it a budget. It checks the option chains for your names and finds the best contract per stock "
                "that fits the budget and your rules. It's a shortlist, not a signal: check the chart before you buy.")
+    windows = list(dflags)
+    if quad and 0 <= (quad - now.date()).days <= 5:
+        windows.insert(0, f"Quad witching week ({quad:%b %d})")
+    if windows:
+        flag("Discount window open: " + "; ".join(windows) + ". Premiums are more likely on sale. "
+             "Good time to shop LEAPS.", "ts-good")
+    else:
+        flag("No market-wide discount window right now (no multi-day SPY drop, no pullback, VIX under its MA). "
+             "The Price column still shows which single contracts are cheap.")
     s_side = st.radio("Calls or puts", ["Calls", "Puts", "Follow the trend"], horizontal=True,
                       key=keep("w_s_side", "Calls"))
     st.caption({"Calls": "Betting the stock goes up.",
@@ -2829,7 +2925,12 @@ def render_search():
     pool_pick = a2.selectbox("Search in", list(pool_names),
                              format_func=lambda k: pool_names[k].get(s_side, k),
                              key=keep("w_s_pool", "Best setups on my watchlist"))
-    max_names = a3.slider("How many stocks to check", 3, 30, key=keep("w_s_names", 12))
+    n_all = len([t for t in dict.fromkeys(watchlist + list(universe)) if not t.startswith("^")])
+    cap = max(30, n_all)
+    if st.session_state.get("w_s_names", 0) > cap:
+        st.session_state["w_s_names"] = cap
+    max_names = a3.slider("How many stocks to check", 3, cap, key=keep("w_s_names", 12),
+                          help="Slide all the way right to check every stock. More stocks = slower search.")
     b1, b2, b3 = st.columns(3)
     s_min_d = b1.number_input("Min days to expiry", 0, 1000, step=15, key=keep("w_s_min_d", 270))
     s_max_d = b2.number_input("Max days to expiry", 0, 1200, step=15, key=keep("w_s_max_d", 550))
@@ -2845,12 +2946,15 @@ def render_search():
         s_spread = r3.number_input("Max spread %", 1.0, 100.0, step=1.0, key=keep("w_s_spread", 12.0))
         s_min_score = r1.slider("Min setup score", 0, 100, step=5, key=keep("w_s_score", 60))
         s_skip_earn = r3.checkbox("Skip names with earnings in the next 14 days", key=keep("w_s_earn", False))
+        s_skip_pricey = r2.checkbox("Skip Pricey contracts", key=keep("w_s_pricey", False),
+                                    help="Leaves out contracts whose IV is well above how much the stock really moves.")
         st.caption("Min setup score works both ways: for puts it means how bearish the setup is. Calls also have "
                    "to sit at or under the strike target (10-yr return halved), like the Contracts tab.")
 
     if st.button("Find contracts", type="primary", key="btn_s_go"):
-        pool = [t for t in dict.fromkeys(watchlist + list(universe))
-                if not t.startswith("^") and t in hist and len(hist[t]) >= 120]
+        everyone = [t for t in dict.fromkeys(watchlist + list(universe)) if not t.startswith("^")]
+        pool = [t for t in everyone if t in hist and len(hist[t]) >= 120]
+        short_hist = [t for t in everyone if t not in pool and t in watchlist]
         rows = []
         for t in pool:
             try:
@@ -2880,8 +2984,12 @@ def render_search():
                 m1 = cand["1M %"].fillna(0)
                 order = {"Calls": -m1, "Puts": m1, "Follow the trend": -m1.abs()}[s_side]
                 cand = cand.assign(_o=order).sort_values("_o")
+            n_qual = len(cand)
+            skipped = list(cand["Ticker"].iloc[max_names:])
             cand = cand.head(max_names)
             found, misses = [], []
+            for t in short_hist:
+                misses.append({"Ticker": t, "Why": "less than 6 months of price history"})
             bar = st.progress(0.0, text="Loading expirations for all stocks at once...")
             names = list(cand["Ticker"])
             mid = (s_min_d + s_max_d) / 2
@@ -2911,8 +3019,9 @@ def render_search():
                 exps_pick = sorted(exps_all, key=lambda e: abs(days_to(e) - mid))[:n_exps]
                 S = (live_quotes(tuple(names)).get(t) or {}).get("Last") or float(hist[t]["Close"].iloc[-1])
                 cg, _ = cagr10(hist[t]["Close"])
+                hv = hist_vol(hist[t]["Close"])
                 best, src = best_contract_for(t, S, cg, side_call, exps_pick, budget, s_dlo, s_dhi,
-                                              s_oi, s_spread, rate, s_money)
+                                              s_oi, s_spread, rate, s_money, hv, s_skip_pricey)
                 if best is None:
                     misses.append({"Ticker": t, "Why": src})
                     continue
@@ -2926,7 +3035,9 @@ def render_search():
                     "Fits": int(budget // best["cost"]) if best["cost"] > 0 else 0,
                     "Spread %": float(best["spread%"]) if pd.notna(best["spread%"]) else np.nan,
                     "OI": int(best["openInterest"]), "Breakeven": float(best["breakeven"]),
-                    "To BE %": float(best["to BE %"]), "Setup": int(setup), "Fit": int(best["Fit"]),
+                    "To BE %": float(best["to BE %"]), "Price": best["Price"],
+                    "IV": float(best["IV"]) if pd.notna(best["IV"]) else np.nan, "Real moves": hv or np.nan,
+                    "Setup": int(setup), "Fit": int(best["Fit"]),
                     "Trend": "Against weekly trend" if against else ("Sideways" if row["Weekly"] == "Sideways"
                                                                      else "With trend"),
                     "Weekly": row["Weekly"], "Stock": S, "Data": src or "Yahoo (delayed)",
@@ -2937,15 +3048,21 @@ def render_search():
                 res = res.sort_values("Rank", ascending=False).reset_index(drop=True)
             st.session_state["search_results"] = res
             st.session_state["search_misses"] = pd.DataFrame(misses)
+            st.session_state["search_skipped"] = (n_qual, skipped)
             st.session_state["search_meta"] = (f"${budget:,.0f} budget, {s_side.lower()}, "
                                                f"{s_money if s_money != 'Any' else 'ITM or OTM'}, "
                                                f"{pool_names[pool_pick].get(s_side, pool_pick).lower()}, "
                                                f"{s_min_d}-{s_max_d} days, delta {s_dlo:.2f}-{s_dhi:.2f}, "
-                                               f"{len(cand)} stocks checked")
+                                               f"{len(cand)} of {n_qual} qualifying stocks checked")
 
     res = st.session_state.get("search_results")
     if res is not None:
         st.markdown(f"##### Results: {st.session_state.get('search_meta', '')}")
+        n_qual, skipped = st.session_state.get("search_skipped", (0, []))
+        if skipped:
+            st.warning(f"{len(skipped)} more stocks qualified but weren't checked because of the "
+                       f"'How many stocks to check' slider: {', '.join(skipped[:15])}"
+                       f"{'...' if len(skipped) > 15 else ''}. Slide it up to {n_qual} to check them all.")
         if res.empty:
             st.info("Nothing fit. Try a bigger budget, a wider delta range, fewer days to expiry, "
                     "or a lower minimum open interest.")
@@ -2962,6 +3079,7 @@ def render_search():
                          f'<div>Delta {r["Delta"]:+.2f}, {r["Type"]}, {r["Days"]} days</div>'
                          f'<div>OI {r["OI"]:,}, spread {spr}</div>'
                          f'<div>Breakeven {r["Breakeven"]:,.2f} ({r["To BE %"]:+.1f}%)</div>'
+                         + price_line(r["Price"], r["IV"], r["Real moves"]) +
                          f'<div class="ts-muted">Setup {r["Setup"]}, contract fit {r["Fit"]}, rank {r["Rank"]}. '
                          f'Loss limit: 20% = ${r["Cost $"] * 0.8:,.0f}, 30% = ${r["Cost $"] * 0.7:,.0f}. '
                          f'{r["Data"]}</div>'
@@ -2988,13 +3106,15 @@ def render_search():
             show = res.drop(columns=["Contract", "Weekly", "Stock"])
             sty_trend = lambda v: f"color: {WARN}" if v == "Against weekly trend" else ""
             sty = show.style.format({"Strike": "{:g}", "Delta": "{:+.2f}", "Limit $": "{:.2f}", "Cost $": "{:,.0f}",
+                                     "IV": "{:.0%}", "Real moves": "{:.0%}",
                                      "Spread %": "{:.1f}", "OI": "{:,}", "Breakeven": "{:,.2f}", "To BE %": "{:+.1f}"},
                                     na_rep="-")
-            show_df(style_map(sty, sty_trend, ["Trend"]),
-                    phone=["Rank", "Ticker", "Side", "Strike", "Expiry", "Limit $", "Delta", "Trend"], hide_index=True)
+            show_df(style_map(style_map(sty, sty_trend, ["Trend"]), price_color, ["Price"]),
+                    phone=["Rank", "Ticker", "Side", "Strike", "Expiry", "Limit $", "Price", "Trend"], hide_index=True)
             st.caption("Rank = 60% contract fit (delta near the middle of your range, tight spread, open interest, "
-                       "short distance to breakeven) + 40% setup score. Earnings dates, news and the chart are "
-                       "still yours to check.")
+                       "short distance to breakeven, and price: Cheap scores higher) + 40% setup score. "
+                       "Price compares the contract's IV to how much the stock really moved over the past year. "
+                       "Earnings dates, news and the chart are still yours to check.")
             st.session_state["search_ctx"] = res.head(10).to_csv(index=False)
         misses = st.session_state.get("search_misses")
         if misses is not None and not misses.empty:
