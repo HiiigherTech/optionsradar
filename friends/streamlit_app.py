@@ -2929,8 +2929,12 @@ def render_search():
     cap = max(30, n_all)
     if st.session_state.get("w_s_names", 0) > cap:
         st.session_state["w_s_names"] = cap
-    max_names = a3.slider("How many stocks to check", 3, cap, key=keep("w_s_names", 12),
-                          help="Slide all the way right to check every stock. More stocks = slower search.")
+    s_all = a3.toggle("All stocks", key=keep("w_s_all", False),
+                      help="Checks every stock that qualifies, however big your watchlist gets. Slower search.")
+    max_names = a3.slider("How many stocks to check", 3, cap, key=keep("w_s_names", 12), disabled=s_all,
+                          label_visibility="collapsed" if s_all else "visible")
+    if s_all:
+        max_names = 10 ** 6
     b1, b2, b3 = st.columns(3)
     s_min_d = b1.number_input("Min days to expiry", 0, 1000, step=15, key=keep("w_s_min_d", 270))
     s_max_d = b2.number_input("Max days to expiry", 0, 1200, step=15, key=keep("w_s_max_d", 550))
@@ -3062,7 +3066,7 @@ def render_search():
         if skipped:
             st.warning(f"{len(skipped)} more stocks qualified but weren't checked because of the "
                        f"'How many stocks to check' slider: {', '.join(skipped[:15])}"
-                       f"{'...' if len(skipped) > 15 else ''}. Slide it up to {n_qual} to check them all.")
+                       f"{'...' if len(skipped) > 15 else ''}. Turn on All stocks to check them all.")
         if res.empty:
             st.info("Nothing fit. Try a bigger budget, a wider delta range, fewer days to expiry, "
                     "or a lower minimum open interest.")
